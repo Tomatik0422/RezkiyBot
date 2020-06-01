@@ -1,0 +1,146 @@
+
+import os
+import re
+import cv2 as cv
+import shutil
+import telebot
+import numpy as np
+import urllib.request
+from PIL import Image, ImageFilter
+
+
+TOKEN = '1172002869:AAEF9-jqW1438rQkGFzE9DEuLAenk8p9Z_s'
+bot = telebot.TeleBot(TOKEN)
+
+
+keyboard1 = telebot.types.ReplyKeyboardMarkup(True, True)
+keyboard1.row('RGB', 'RG')
+
+
+RESULT_STORAGE_DIR = 'temp'
+PARAMS = dict()
+
+
+def get_image_id_from_message(message):
+    return message.photo[len(message.photo) - 1].file_id
+
+def save_image_from_message(message):
+    image_id = get_image_id_from_message(message)
+    file_path = bot.get_file(image_id).file_path
+    image_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+    image_name = f"{image_id}.png"
+    urllib.request.urlretrieve(image_url, f"{RESULT_STORAGE_DIR}/{image_name}")
+    return image_name
+
+
+def is_correct_mode(sentence):
+    is_correct = re.match(r'^[rgb]+$', sentence)
+    return bool(is_correct)
+
+def preprocess_sentence(sentence):
+    sentence = re.sub(r'\W+', '', sentence.lower().strip())  # Delete special symbols
+    sentence = re.sub(r'([a-z])\1+', r'\1', sentence)  # Remove duplicates
+    return sentence
+
+def filter_image(image_name, params):
+    content_image = cv.imread(f"{RESULT_STORAGE_DIR}/{image_name}")
+
+    mode = list(params['mode'])
+    percent = params['percent'] * 2 / 10
+
+    RGB = {'r': 2,
+           'g': 1,
+           'b': 0}
+
+    for chanel in mode:
+        img = content_image[:, :, RGB[chanel]]
+        # Blur image
+        blur = cv.medianBlur(img, 3)
+        lap = cv.Laplacian(blur, cv.CV_64F)
+
+        # Calculate the sharpened image
+        sharp = img - lap * percent
+
+        # Saturate the pixels in either direction
+        sharp[sharp > 255] = 255
+        sharp[sharp < 0] = 0
+        content_image[:, :, RGB[chanel]] = sharp
+
+    sharp_image_filename = f'sharp_{image_name}'
+    cv.imwrite(f"{RESULT_STORAGE_DIR}/{sharp_image_filename}", content_image)
+    return sharp_image_filename
+
+def process_image(message, image_name, params):
+    sharp_image_filename = filter_image(image_name, params=params)
+
+    bot.send_message(chat_id=message.chat.id, text='Успешно!')
+    bot.send_photo(message.chat.id, open(f'{RESULT_STORAGE_DIR}/{sharp_image_filename}', 'rb'),
+                   caption=f'Я использовал такие параметры::\nТип: {params["mode"].upper()}\nПроцент: {params["percent"]}')
+    bot.send_message(chat_id=message.chat.id,
+                     text='Получилось круто! Давай еще раз, загрузи фото и снова обработаю!')
+
+    cleanup_remove_images(image_name, sharp_image_filename)
+    PARAMS[message.chat.id] = None
+
+
+def cleanup_remove_images(image_name, image_name_new):
+    os.remove(f'{RESULT_STORAGE_DIR}/{image_name}')
+    os.remove(f'{RESULT_STORAGE_DIR}/{image_name_new}')
+
+
+def clear_chat_info(chat_id):
+    PARAMS[chat_id] = None
+
+
+@bot.message_handler(commands=['start'])
+def start_message(message):
+    bot.send_message(message.chat.id, 'Привет! Я бот, чтобы обработать твое изображение!'
+                                      'Посмотри как я работаю в команде /how!', parse_mode='html')
+
+
+@bot.message_handler(commands=['how'])
+def help_handler(message):
+    bot.send_message(message.chat.id, '''Как же я работаю?
+    \nПосле того, как ты отправишь мне фото, я тебя попрошу выбрать тип изменения твоего изображения.
+    \nЯ могу либо воздействовать на всю картинку сразу, поменяв резкость по всему изображению, либо только на участках 
+    красного и зеленого. Да, они есть на твоем изображении :)
+    \nПосле того, как ты определишься с выбором типа изменения, то нужно будет ввести значение от 1 до 10. Это значение
+     - сила, на сколько будет повышаться резкость. После этого, изображение обработано! Рад тебе помочь!''')
+
+
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    cid = message.chat.id
+
+    if PARAMS.get(cid) is not None:
+        if PARAMS[cid].get('mode') is None:
+            if is_correct_mode(preprocess_sentence(message.text)):
+                PARAMS[cid]['mode'] = preprocess_sentence(message.text)
+                bot.send_message(chat_id=cid, text='Отлично, а теперь введи насколько сильно ты хочешь изменить '
+                                                   'резкость? Мне нужно значение от 1 до 10.:')
+            else:
+                bot.send_message(chat_id=cid, text='Прости, но немного неправильно. Тебе нужно ввести или rgb, или rg')
+        else:
+            if message.text.lstrip('-').isdigit():
+                if 0 <= float(message.text) <= 10:
+                    PARAMS[cid]['percent'] = float(message.text)
+                    process_image(message, image_name=PARAMS[cid]['image'], params=PARAMS[cid])
+                    clear_chat_info(cid)
+                else:
+                    bot.send_message(chat_id=cid, text='Прости, немного не то. Мне нужно значение от 1 до 10')
+            else:
+                bot.send_message(chat_id=cid, text='Извини, немного неправильно. Нужно ввести номер.')
+    else:
+        bot.send_message(chat_id=cid, text='Прости, но у меня нет никаких изображений. Загрузи его прямо сейчас!')
+
+
+if __name__ == '__main__':
+    try:
+        if not os.path.exists(RESULT_STORAGE_DIR):
+            os.makedirs(RESULT_STORAGE_DIR)
+        bot.polling()
+    except Exception as e:
+        print(e)
+    finally:
+        if os.path.exists(RESULT_STORAGE_DIR):
+            shutil.rmtree(RESULT_STORAGE_DIR)
